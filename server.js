@@ -1,90 +1,65 @@
-const express = require('express');
-const { bundle } = require('@remotion/bundler');
-const { renderMedia, selectComposition } = require('@remotion/renderer');
-const axios = require('axios');
-const path = require('path');
-const { Storage } = require('@google-cloud/storage');
-const { v4: uuidv4 } = require('uuid');
+'use strict';
 
-const app = express();
-app.use(express.json());
+const http = require('node:http');
+const { GenerationOwner } = require('./lib/owner');
+const { LIMITS, GenerationError, safeError, errorBody } = require('./lib/policy');
 
-const FAL_KEY = process.env.FAL_API_KEY;
-const ELEVEN_KEY = process.env.ELEVENLABS_API_KEY;
-const BUCKET = process.env.GCS_BUCKET_NAME || "mcp-box-atomic-backups";
-
-app.post('/generate', async (req, res) => {
-  const { scenes } = req.body; 
-  const jobId = uuidv4();
-  res.json({ job_id: jobId, status: "processing", message: "Flux I2V -> MiniMax -> Remotion Pipeline Started" });
-
-  (async () => {
+function createApp({ owner, express = require('express') } = {}) {
+  if (!owner) throw new Error('Generation owner is required');
+  const app = express();
+  app.disable('x-powered-by');
+  // Cloud Run IAM authenticates invocation before this application. Never trust
+  // caller-supplied identity headers as an application authentication decision.
+  app.use(express.json({ limit: LIMITS.bodyBytes, strict: true }));
+  app.get('/health', (_req, res) => {
+    res.status(owner.available ? 200 : 503).type('text/plain').send(owner.available ? 'OK' : 'UNAVAILABLE');
+  });
+  app.post('/generate', async (req, res) => {
+    const controller = new AbortController();
+    const onClose = () => { if (!res.writableEnded) controller.abort(new GenerationError('disconnected')); };
+    res.once('close', onClose);
     try {
-      console.log(`[${jobId}] Starting pro generation...`);
-      let composedScenes = [];
-      let totalFrames = 0;
-
-      for (let i = 0; i < scenes.length; i++) {
-         const s = scenes[i];
-         console.log(`[${jobId}] Processing Scene ${i+1}`);
-         
-         // 1. Voice (ElevenLabs)
-         const elevenRes = await axios.post('https://api.elevenlabs.io/v1/text-to-speech/pNInz6obbfIdGcilceT3',
-           { text: s.text, model_id: "eleven_multilingual_v2", voice_settings: { stability: 0.45, similarity_boost: 0.85 } },
-           { headers: { 'xi-api-key': ELEVEN_KEY, 'Content-Type': 'application/json' }, responseType: 'arraybuffer' }
-         );
-         const fs = require('fs');
-         const audioPath = `/tmp/${jobId}_scene_${i}.mp3`;
-         fs.writeFileSync(audioPath, elevenRes.data);
-         const durationFrames = 150; // In prod, parse audio length
-         
-         // 2. Keyframe (FLUX.1)
-         const fluxRes = await axios.post('https://fal.run/fal-ai/flux/dev',
-           { prompt: s.prompt, image_size: "landscape_16_9" },
-           { headers: { Authorization: `Key ${FAL_KEY}` } }
-         );
-         const keyframeUrl = fluxRes.data.images[0].url;
-
-         // 3. Animate (MiniMax Video-01 Image-to-Video)
-         const fullPrompt = s.camera_move ? `${s.prompt} [${s.camera_move}]` : s.prompt;
-         const falRes = await axios.post('https://fal.run/fal-ai/minimax/video-01/image-to-video',
-           { prompt: fullPrompt, image_url: keyframeUrl },
-           { headers: { Authorization: `Key ${FAL_KEY}` } }
-         );
-         
-         composedScenes.push({ 
-           videoUrl: falRes.data.video.url, 
-           audioUrl: `file://${audioPath}`, 
-           durationFrames 
-         });
-         
-         // Account for transition overlap (15 frames)
-         totalFrames += (i === 0) ? durationFrames : (durationFrames - 15);
+      const result = await owner.generate(req.body, { signal: controller.signal });
+      if (!res.destroyed) res.status(200).json(result);
+    } catch (error) {
+      const failure = safeError(error);
+      if (!res.destroyed) {
+        if (failure.code === 'busy') res.set('Retry-After', '10');
+        res.status(failure.status).json(errorBody(failure, failure.jobId, failure.result));
       }
+    } finally { res.removeListener('close', onClose); }
+  });
+  app.use((error, _req, res, _next) => {
+    const failure = new GenerationError(error?.type === 'entity.too.large' ? 'body_too_large' : 'invalid_request');
+    if (!res.headersSent) res.status(failure.status).json(errorBody(failure));
+    else res.destroy();
+  });
+  return app;
+}
 
-      console.log(`[${jobId}] Bundling Remotion...`);
-      const bundled = await bundle({ entryPoint: path.resolve('./src/index.ts') });
-      const composition = await selectComposition({
-        serveUrl: bundled, id: 'Main', inputProps: { scenes: composedScenes }
-      });
-      composition.durationInFrames = totalFrames;
+function start() {
+  const owner = new GenerationOwner({
+    bucket: process.env.GCS_BUCKET_NAME || 'mcp-box-atomic-backups',
+    isConfigured: () => Boolean(process.env.FAL_API_KEY?.trim() && process.env.ELEVENLABS_API_KEY?.trim()),
+    logger: (entry) => console.log(JSON.stringify(entry)),
+  });
+  const server = http.createServer(createApp({ owner }));
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 60_000; // Body receipt only; the response has its own generation deadline.
+  server.listen(process.env.PORT || 8080, () => console.log('Video engine ready'));
+  let stopping = false;
+  async function shutdown() {
+    if (stopping) return;
+    stopping = true;
+    server.close();
+    try { await owner.shutdown(); process.exitCode = 0; }
+    catch { console.error('Owned temporary file cleanup failed during shutdown'); process.exitCode = 1; }
+    server.closeAllConnections();
+  }
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  return { server, owner, shutdown };
+}
 
-      const outPath = `/tmp/${jobId}.mp4`;
-      console.log(`[${jobId}] Rendering composition...`);
-      await renderMedia({
-        composition, serveUrl: bundled, codec: 'h264', outputLocation: outPath, inputProps: { scenes: composedScenes }
-      });
-
-      console.log(`[${jobId}] Uploading to GCS...`);
-      const storage = new Storage();
-      const dest = `renders/${jobId}.mp4`;
-      await storage.bucket(BUCKET).upload(outPath, { destination: dest });
-      console.log(`[${jobId}] Finished: gs://${BUCKET}/${dest}`);
-    } catch (e) {
-      console.error(`[${jobId}] Error:`, e.response?.data || e.message);
-    }
-  })();
-});
-
-app.get('/health', (req, res) => res.send('OK'));
-app.listen(process.env.PORT || 8080, () => console.log("Engine active on 8080"));
+if (require.main === module) start();
+module.exports = { createApp, start };
