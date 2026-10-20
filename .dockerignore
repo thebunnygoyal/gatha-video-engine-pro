@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!server.js
+!lib/
+!lib/**
+!src/
+!src/**
+!tests/
+!tests/**
+!verify/
+!verify/**
